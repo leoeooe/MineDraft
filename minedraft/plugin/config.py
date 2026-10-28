@@ -13,13 +13,13 @@ from minedraft.patching import MinePatch
 class MineSpeculativeConfig(SpeculativeConfig):
 
     draft_temperature: Optional[float] = None
-    tetris: Optional[bool] = None
-    tetris_extra_proposals: Optional[int] = None
-    tetris_turn_on_batch_size: Optional[int] = None
-    tetris_capacity: Optional[int] = None
-    is_parallel: Optional[bool] = None
-    force_mqa: Optional[bool] = None
-    force_pearl: Optional[bool] = None
+    tetris: bool = False
+    tetris_extra_proposals: int = 3
+    tetris_turn_on_batch_size: int = 1
+    tetris_capacity: int = 0
+    is_parallel: bool = False
+    force_mqa: bool = False
+    force_pearl: bool = False
 
 
 class SpeculativeConfigPatch(MinePatch[SpeculativeConfig]):
@@ -37,8 +37,17 @@ class SpeculativeConfigPatch(MinePatch[SpeculativeConfig]):
 
     def __post_init__(self):
         if self.tetris:
+            if self.num_speculative_tokens is None or self.num_speculative_tokens <= 0:
+                raise ValueError("Tetris requires positive num_speculative_tokens")
+            if self.tetris_extra_proposals < 0 or self.tetris_capacity < 0:
+                raise ValueError("Tetris extra proposals and capacity must be non-negative")
+            if self.tetris_turn_on_batch_size < 1:
+                raise ValueError("Tetris batch threshold must be positive")
             self.num_speculative_tokens += self.tetris_extra_proposals
         if self.is_parallel:
+            if self.target_parallel_config.tensor_parallel_size < 2:
+                raise ValueError("Parallel SD requires at least two devices: "
+                                 "one draft rank plus the target TP ranks")
             if self.draft_tensor_parallel_size is None:
                 self.draft_tensor_parallel_size = 1
             elif self.draft_tensor_parallel_size != 1:
@@ -53,9 +62,10 @@ class SpeculativeConfigPatch(MinePatch[SpeculativeConfig]):
 
         self._orig_post_init()
 
-        self.draft_model_config.override_generation_config.update({
-            "temperature": self.draft_temperature
-        })
+        if self.draft_temperature is not None and self.draft_model_config is not None:
+            self.draft_model_config.override_generation_config.update({
+                "temperature": self.draft_temperature
+            })
 
     @classmethod
     def from_dict(cls, dict_value: dict) -> SpeculativeConfig:
@@ -78,8 +88,10 @@ class VllmConfigPatch(MinePatch[VllmConfig]):
             if self.speculative_config and self.speculative_config.is_parallel:
                 # [Parallel SD] Restore tp size temporarily
                 self.parallel_config.tensor_parallel_size -= 1
-                self.model_config.verify_with_parallel_config(self.parallel_config)
-                self.parallel_config.tensor_parallel_size += 1
+                try:
+                    self.model_config.verify_with_parallel_config(self.parallel_config)
+                finally:
+                    self.parallel_config.tensor_parallel_size += 1
             else:
                 self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(

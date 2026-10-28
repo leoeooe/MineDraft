@@ -5,7 +5,7 @@ from vllm.distributed import communication_op
 from vllm.distributed.parallel_state import get_tp_group
 
 from minedraft.patching import MinePatch
-from .parallel_state import get_non_driver_tp_group
+from .parallel_state import Works, get_non_driver_tp_group
 
 
 class CommunicationOpModulePatch(MinePatch[communication_op]):
@@ -31,13 +31,19 @@ class CommunicationOpModulePatch(MinePatch[communication_op]):
                                      dst: int = 0,
                                      dim: int = -1) -> Optional[torch.Tensor]:
         """Gather the input tensor across model parallel group."""
-        return get_non_driver_tp_group().gather(input_, dst, dim)
+        group = get_non_driver_tp_group()
+        if input_.device.type == "npu" and group.world_size > 1:
+            # Use the HCCL all-gather path already used by Ascend models.
+            # Preserve gather semantics: only the representative gets logits.
+            output = group.all_gather(input_.contiguous(), dim)
+            return output if group.rank_in_group == dst else None
+        return group.gather(input_, dst, dim)
 
     @staticmethod
     def broadcast_tensor_dict(tensor_dict: Optional[dict[Any, Union[torch.Tensor,
                                                                     Any]]] = None,
                               src: int = 0, async_op: bool = False):
         if not torch.distributed.is_initialized():
-            return tensor_dict
+            return Works(tensor_dict, []) if async_op else tensor_dict
         return get_tp_group().broadcast_tensor_dict(tensor_dict, src,
                                                     async_op=async_op)

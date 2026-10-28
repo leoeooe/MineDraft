@@ -4,10 +4,11 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch import nn
 from vllm.model_executor.layers.rejection_sampler import RejectionSampler
+from vllm.platforms import current_platform
 
 from minedraft.patching import MinePatch
 
-if find_spec("flashinfer"):
+if current_platform.is_cuda_alike() and find_spec("flashinfer"):
     """
     Consider utilizing the FlashInfer rejection sampling kernel initially,
     as it employs a dedicated kernel rather than relying on 
@@ -48,7 +49,9 @@ class RejectionSamplerPatch(MinePatch[RejectionSampler], nn.Module):
 
         # If use Flashinfer chain_speculative_sampling kernel
         # for rejection sampling
-        if self.use_flashinfer and chain_speculative_sampling is not None:
+        if (draft_probs.device.type == "cuda" and self.use_flashinfer
+                and chain_speculative_sampling is not None
+                and proposal_lens is None and not seeded_seqs):
             batch_size, k, _ = draft_probs.shape
 
             (output_token_ids, accepted_token_num,
@@ -74,14 +77,15 @@ class RejectionSamplerPatch(MinePatch[RejectionSampler], nn.Module):
                 bonus_mask = torch.zeros_like(target_with_bonus_probs)
 
                 # Use advanced indexing to set the specified indices to zero
-                bonus_mask[torch.arange(batch_size), proposal_lens, :] = 1
+                rows = torch.arange(batch_size, device=draft_probs.device)
+                bonus_mask[rows, proposal_lens, :] = 1
 
                 # Apply the mask to target_with_bonus_probs
                 target_with_bonus_probs = target_with_bonus_probs * (1 - bonus_mask)
 
             accepted, recovered_token_ids = (
                 self._batch_modified_rejection_sampling(
-                    target_with_bonus_probs[:, :-1],
+                    target_with_bonus_probs[:, :-1].contiguous(),
                     draft_probs,
                     draft_token_ids,
                     seeded_seqs,

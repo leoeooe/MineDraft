@@ -102,6 +102,7 @@ class MineExecuteModelRequest(ExecuteModelRequest):
             running_queue_size=self.running_queue_size,
             previous_hidden_states=self.previous_hidden_states,
             num_steps=self.num_steps,
+            spec_step_idx=self.spec_step_idx,
             finished_requests_ids=self.finished_requests_ids,
             preempted_requests_ids=self.preempted_requests_ids,
             last_sampled_token_ids=self.last_sampled_token_ids.clone()

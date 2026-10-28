@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional, Union
 
 import torch
 from vllm.model_executor.layers.spec_decode_base_sampler import SpecDecodeBaseSampler
@@ -34,7 +34,17 @@ class AsyncMetricsCollectorPatch(MinePatch[AsyncMetricsCollector]):
             0, dtype=torch.long, device="cpu", pin_memory=pin_memory)
         self._aggregrate_num_reqs = 0
 
-    def _copy_rejsample_metrics_async(self: AsyncMetricsCollector) -> torch.cuda.Event:
+    def init_gpu_tensors(self, rank: int) -> None:
+        self.init_tensors(rank, current_platform.device_type)
+
+    def init_tensors(self, rank: int,
+                     device_type: Union[torch.device, str] = None) -> None:
+        self._rank = rank
+        stream = current_platform.Stream
+        if stream is not None:
+            self._copy_stream = stream()
+
+    def _copy_rejsample_metrics_async(self: AsyncMetricsCollector) -> Any:
 
         assert self._copy_stream is not None
         self._copy_stream.wait_stream(current_platform.current_stream())
@@ -65,7 +75,7 @@ class AsyncMetricsCollectorPatch(MinePatch[AsyncMetricsCollector]):
     def _collect_rejsample_metrics(
             self: AsyncMetricsCollector,
             k: int,
-            ready_event: torch.cuda.Event) -> MineSpecDecodeWorkerMetrics:
+            ready_event: Any) -> MineSpecDecodeWorkerMetrics:
 
         ready_event.synchronize()
 

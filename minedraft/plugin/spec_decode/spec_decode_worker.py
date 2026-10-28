@@ -71,6 +71,7 @@ class SpecDecodeWorkerModulePatch(MinePatch[spec_decode_worker]):
             target_worker_config.parallel_config.sd_worker_cls
         cls = resolve_obj_by_qualname(
             target_worker_config.parallel_config.worker_cls)
+        kwargs["vllm_config"] = target_worker_config
         target_worker = cls(*args, **kwargs)
         # Set the disable_logprobs variable in the TargetModelRunner instance
         # as per its value specified in the SpeculativeConfig.
@@ -182,6 +183,13 @@ class SpecDecodeWorkerPatch(MinePatch[SpecDecodeWorker]):
                             TP1DraftModelRunner,
                         )
                         draft_worker_kwargs["model_runner_cls"] = TP1DraftModelRunner
+                    elif current_platform.device_type == "npu":
+                        from vllm_ascend.spec_decode.minedraft import (
+                            get_minedraft_draft_model_runner_cls,
+                        )
+                        draft_worker_kwargs["model_runner_cls"] = (
+                            get_minedraft_draft_model_runner_cls(
+                                draft_worker_kwargs["vllm_config"]))
                 else:
                     if draft_model_config.hf_config.model_type == "eagle":
                         raise NotImplementedError(
@@ -334,11 +342,6 @@ class SpecDecodeWorkerPatch(MinePatch[SpecDecodeWorker]):
             self._run_non_driver_rank()
             return []
 
-        # [Parallel SD] Record the start time of the batch
-        cur_step_trace: Step = TRACER.current_step
-        assert cur_step_trace is not None
-        cur_step_trace.batch_start_us = time.perf_counter() * 1e6
-
         if execute_model_req is None:
             # This signals that there's no more requests to process for now.
             # All workers are running infinite loop with broadcast_tensor_dict,
@@ -347,8 +350,16 @@ class SpecDecodeWorkerPatch(MinePatch[SpecDecodeWorker]):
             # execution loop.
             broadcast_tensor_dict({}, src=0)
             # [Parallel SD] Record the end time of the batch
-            cur_step_trace.batch_end_us = time.perf_counter() * 1e6
+            if TRACER.current_step is not None:
+                TRACER.current_step.batch_end_us = time.perf_counter() * 1e6
             return []
+
+        # Shutdown can happen without a trace (e.g. initialization failure).
+        cur_step_trace: Step = TRACER.current_step
+        if cur_step_trace is None:
+            TRACER.add(Step)
+            cur_step_trace = TRACER.current_step
+        cur_step_trace.batch_start_us = time.perf_counter() * 1e6
 
         self._track_finished_requests(execute_model_req)
         # [Parallel SD] Update housekeeping data structures of
@@ -659,7 +670,8 @@ class SpecDecodeWorkerPatch(MinePatch[SpecDecodeWorker]):
                                           SpecDecodeStochasticBaseSampler):
             sampler_extra_kwargs["seeded_seqs"] = {
                 idx: self.generators[sgm.request_id]
-                for idx, sgm in enumerate(seq_group_metadata_list)
+                for idx, source_idx in enumerate(spec_indices)
+                for sgm in [seq_group_metadata_list[source_idx]]
                 if sgm.sampling_params.seed is not None
             }
 
@@ -843,27 +855,23 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
         if self.rank == self._driver_rank:
             # [Parallel SD] Driver rank determines the number of
             # available blocks given the proposer if applicable.
-            try:
-                result = self.proposer_worker.determine_num_available_blocks()
-                num_gpu_blocks, num_cpu_blocks = result
-                assert num_gpu_blocks > 0 and num_cpu_blocks > 0
-                return num_gpu_blocks, num_cpu_blocks
-            except Exception:
-                return (1 << 32) - 1, (1 << 32) - 1
+            # A profiling failure must not masquerade as unlimited KV memory.
+            # Zero CPU blocks is valid when swap space is disabled.
+            return self.proposer_worker.determine_num_available_blocks()
         else:
             return self.scorer_worker.determine_num_available_blocks()
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
         self.scorer_worker.parallel_config.tensor_parallel_size -= 1
-
-        if self.rank != self._driver_rank:
-            self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                                num_cpu_blocks=num_cpu_blocks)
-        self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
-                                              num_cpu_blocks=num_cpu_blocks)
-
-        self.scorer_worker.parallel_config.tensor_parallel_size += 1
+        try:
+            if self.rank != self._driver_rank:
+                self.scorer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
+                                                    num_cpu_blocks=num_cpu_blocks)
+            self.proposer_worker.initialize_cache(num_gpu_blocks=num_gpu_blocks,
+                                                  num_cpu_blocks=num_cpu_blocks)
+        finally:
+            self.scorer_worker.parallel_config.tensor_parallel_size += 1
 
     def _run_non_driver_rank(self) -> bool:
         assert self.rank != self._driver_rank
@@ -889,20 +897,20 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
                     dst=0
                 )
                 get_tp_group().send(
-                    sampler_output.sampled_token_ids,
+                    sampler_output.sampled_token_ids.contiguous(),
                     dst=0
                 )
                 get_tp_group().send(
-                    sampler_output.sampled_token_probs,
+                    sampler_output.sampled_token_probs.contiguous(),
                     dst=0
                 )
                 get_tp_group().send(
-                    sampler_output.logprobs,
+                    sampler_output.logprobs.contiguous(),
                     dst=0
                 )
                 if sampler_output.hidden_states is not None:
                     get_tp_group().send(
-                        sampler_output.hidden_states,
+                        sampler_output.hidden_states.contiguous(),
                         dst=0
                     )
                 if sampler_output.prefill_hidden_states is not None:
@@ -916,7 +924,7 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
                         dst=0
                     )
                     get_tp_group().send(
-                        sampler_output.prefill_hidden_states,
+                        sampler_output.prefill_hidden_states.contiguous(),
                         dst=0
                     )
                 else:
@@ -926,7 +934,7 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
                     )
             else:
                 get_tp_group().send(
-                    torch.zeros(2, dtype=torch.uint32, device=self.device),
+                    torch.zeros(2, dtype=torch.int64, device=self.device),
                     dst=0
                 )
 
@@ -1060,92 +1068,47 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
 
     def _prepare_previous_proposals(
         self,
-        execute_model_req: MineExecuteModelRequest) -> SpeculativeProposals:
-        """Prepare proposals generated in the last step for speculative decoding
+        execute_model_req: MineExecuteModelRequest,
+    ) -> SpeculativeProposals:
+        """Align cached drafts by request ID, never by scheduler position.
+
+        Finished, preempted and newly scheduled requests can change both batch
+        size and order between the drafting and verification steps.
         """
-        mask = self._valid_previous_proposals
-        previous_proposals = self._previous_proposals
+        previous = self._previous_proposals
         self._previous_proposals = None
-
-        if self.use_pearl:
-            if previous_proposals is None or len(self._previous_request_ids) == 0 or not mask.any():
-                bs = len(execute_model_req.seq_group_metadata_list)
-                k = execute_model_req.num_lookahead_slots
-
-                proposal_lens = torch.zeros((bs,), dtype=torch.int64,
-                                            device=self.device)
-                proposal_logprobs = torch.zeros((bs, k, self._vocab_size),
-                                               dtype=self.probs_dtype,
-                                               device=self.device)
-                proposal_probs = torch.zeros((bs, k, self._vocab_size),
-                                             dtype=self.probs_dtype,
-                                             device=self.device)
-                proposal_token_ids = torch.full((bs, k),
-                                               fill_value=VLLM_INVALID_TOKEN_ID,
-                                               dtype=self.token_id_dtype,
-                                               device=self.device)
-                return SpeculativeProposals(
-                    proposal_lens=proposal_lens,
-                    proposal_logprobs=proposal_logprobs,
-                    proposal_probs=proposal_probs,
-                    proposal_token_ids=proposal_token_ids,
-                    no_proposals=True
-                )
-
-            bs = len(execute_model_req.seq_group_metadata_list)
-            k = execute_model_req.num_lookahead_slots
-
-            proposal_lens = previous_proposals.proposal_lens.new_zeros((bs,))
-            proposal_logprobs = previous_proposals.proposal_logprobs.new_zeros((bs, k, self._vocab_size))
-            proposal_probs = previous_proposals.proposal_probs.new_zeros((bs, k, self._vocab_size))
-            proposal_token_ids = previous_proposals.proposal_token_ids.new_full((bs, k), fill_value=VLLM_INVALID_TOKEN_ID)
-
-            for new_i, seq_metadata in enumerate(execute_model_req.seq_group_metadata_list):
-                req_id = seq_metadata.request_id
-                if (old_i := self._previous_request_ids.get(req_id)) is not None:
-                    proposal_lens[new_i] = previous_proposals.proposal_lens[old_i]
-                    proposal_logprobs[new_i] = previous_proposals.proposal_logprobs[old_i]
-                    proposal_probs[new_i] = previous_proposals.proposal_probs[old_i]
-                    proposal_token_ids[new_i] = previous_proposals.proposal_token_ids[old_i]
-
-            return SpeculativeProposals(
-                proposal_lens=proposal_lens,
-                proposal_logprobs=proposal_logprobs,
-                proposal_probs=proposal_probs,
-                proposal_token_ids=proposal_token_ids,
-                no_proposals=execute_model_req.num_lookahead_slots == 0
-            )
-
-        if len(execute_model_req.seq_group_metadata_list) != len(mask):
-            # Parallel speculative decoding w/ chunked prefill (prefill + decodes)
-            bs = len(execute_model_req.seq_group_metadata_list)
-            k = execute_model_req.num_lookahead_slots
-            non_spec_len = bs - len(mask)
-
-            new_mask = mask.new_zeros((bs,))
-            proposal_lens = previous_proposals.proposal_lens.new_zeros((bs,))
-            proposal_logprobs = previous_proposals.proposal_logprobs.new_zeros((bs, k, self._vocab_size))
-            proposal_probs = previous_proposals.proposal_probs.new_zeros((bs, k, self._vocab_size))
-            proposal_token_ids = previous_proposals.proposal_token_ids.new_full((bs, k), fill_value=VLLM_INVALID_TOKEN_ID)
-
-            new_mask[non_spec_len:] = mask
-            proposal_lens[new_mask] = previous_proposals.proposal_lens
-            proposal_logprobs[new_mask] = previous_proposals.proposal_logprobs
-            proposal_probs[new_mask] = previous_proposals.proposal_probs
-            proposal_token_ids[new_mask] = previous_proposals.proposal_token_ids
-            return SpeculativeProposals(
-                proposal_lens=proposal_lens,
-                proposal_logprobs=proposal_logprobs,
-                proposal_probs=proposal_probs,
-                proposal_token_ids=proposal_token_ids
-            )
-
+        request_ids = self._previous_request_ids or {}
+        valid = self._valid_previous_proposals
+        batch_size = len(execute_model_req.seq_group_metadata_list)
+        k = execute_model_req.num_lookahead_slots
+        lengths = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
+        token_ids = torch.full((batch_size, k), VLLM_INVALID_TOKEN_ID,
+                               dtype=self.token_id_dtype, device=self.device)
+        probs = torch.zeros((batch_size, k, self._vocab_size),
+                            dtype=self.probs_dtype, device=self.device)
+        logprobs = torch.zeros_like(probs)
+        if previous is not None and valid is not None:
+            valid_rows = valid.tolist()
+            previous_lengths = previous.proposal_lens.tolist()
+            source_rows, destination_rows = [], []
+            for destination, metadata in enumerate(execute_model_req.seq_group_metadata_list):
+                source = request_ids.get(metadata.request_id)
+                if (source is not None and source < len(valid_rows)
+                        and valid_rows[source] and previous_lengths[source] > 0):
+                    source_rows.append(source)
+                    destination_rows.append(destination)
+            if source_rows:
+                if previous.proposal_token_ids.shape[1] != k:
+                    raise ValueError("Cached proposal width changed between decode steps")
+                lengths[destination_rows] = previous.proposal_lens[source_rows]
+                token_ids[destination_rows] = previous.proposal_token_ids[source_rows]
+                probs[destination_rows] = previous.proposal_probs[source_rows]
+                if previous.proposal_logprobs is not None:
+                    logprobs[destination_rows] = previous.proposal_logprobs[source_rows]
         return SpeculativeProposals(
-            proposal_lens=previous_proposals.proposal_lens[mask],
-            proposal_logprobs=previous_proposals.proposal_logprobs[mask],
-            proposal_probs=previous_proposals.proposal_probs[mask],
-            proposal_token_ids=previous_proposals.proposal_token_ids[mask]
-        )
+            proposal_lens=lengths, proposal_token_ids=token_ids,
+            proposal_probs=probs, proposal_logprobs=logprobs,
+            no_proposals=not bool(lengths.any()))
 
     @nvtx_range("ParallelSpecDecodeWorker._run_no_spec")
     def _run_no_spec(self,
@@ -1156,6 +1119,11 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
         with Timer(profile_time) as timer:
             # [Parallel SD] Execute the scorer model.
             self.scorer_worker.execute_model(execute_model_req)
+
+            work = execute_model_req.scoring_async_handle
+            if work is not None:
+                work.wait()
+                execute_model_req.scoring_async_handle = None
 
             sampler_output = self.scorer._recv_sampler_output_from_repr_scorer()
 
@@ -1561,7 +1529,8 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
                                           SpecDecodeStochasticBaseSampler):
             sampler_extra_kwargs["seeded_seqs"] = {
                 idx: self.generators[sgm.request_id]
-                for idx, sgm in enumerate(seq_group_metadata_list)
+                for idx, source_idx in enumerate(spec_indices)
+                for sgm in [seq_group_metadata_list[source_idx]]
                 if sgm.sampling_params.seed is not None
             }
 
@@ -1745,8 +1714,9 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
             dtype=self.probs_dtype,
             device=self.device
         )
-        padded_accepted_token_ids[is_sending_batch] = accepted_token_ids
-        padded_target_logprobs[is_sending_batch] = target_logprobs
+        output_mask = is_sending_batch.to(device=self.device)
+        padded_accepted_token_ids[output_mask] = accepted_token_ids
+        padded_target_logprobs[output_mask] = target_logprobs
 
         return super()._create_output_sampler_list(
             orig_seq_group_metadata_list,
@@ -1762,10 +1732,9 @@ class ParallelSpecDecodeWorker(SpecDecodeWorker):
             return super()._track_finished_requests(execute_model_req)
     
         for finished_request in execute_model_req.finished_requests_ids:
-            for seq_id in self._request_id_seq_id_mapping[finished_request]:
+            for seq_id in self._request_id_seq_id_mapping.pop(finished_request, []):
                 self._seq_with_bonus_token_in_last_step.discard(seq_id)
-            del self._request_id_seq_id_mapping[finished_request]
-            del self._previous_request_ids[finished_request]
+            self._previous_request_ids.pop(finished_request, None)
 
     def _track_preempted_requests(self, execute_model_req: MineExecuteModelRequest):
         """

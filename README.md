@@ -66,7 +66,6 @@ Speculative decoding (SD) uses a small *draft model* to propose candidate tokens
 |---------|---------|
 | [vLLM](https://github.com/vllm-project/vllm) | 0.9.2 |
 | PyTorch | 2.7.0 |
-| torch-scatter | 2.1.2 |
 
 ---
 
@@ -119,7 +118,7 @@ pip install -e ".[benchmark]" --no-build-isolation
 ```
 
 This installs:
-- **Core**: `torch-scatter==2.1.2`
+- **Core**: reuses PyTorch from the vLLM environment; no `torch-scatter` extension
 - **Benchmark**: `datasets`, `nvitop`, `pandas`, `numpy`, `matplotlib`, `IPython`, `tqdm`
 
 ---
@@ -303,3 +302,33 @@ If you find MineDraft useful in your research, please cite:
 ```
 
 ---
+
+## Ascend NPU port (vLLM 0.9.2)
+
+The `codex/minedraft-ascend-v092` branch includes an Ascend adaptation together
+with the matching branch of the local `vllm-ascend` 0.9.2rc1 checkout. Install
+both modified source trees; the published CUDA-oriented setup above does not
+include this adaptation. The shared MineDraft package no longer requires
+`torch-scatter`.
+
+Use Linux, `VLLM_USE_V1=0`, `VLLM_ASCEND_ENABLE_MINEDRAFT=1`, eager execution,
+and the multiprocessing executor.
+The initial supported path uses dense text models with an independent draft
+model on one dedicated NPU and the target on the remaining NPUs. The direct
+vLLM `tensor_parallel_size` includes the draft rank (target TP + 1).
+Tetris is currently rejected on NPU because the batch-expansion scorer has not
+been adapted to variable proposal lengths.
+
+The matching vllm-ascend checkout contains deployment instructions at
+`docs/source/user_guide/feature_guide/minedraft.md` and a token-by-token greedy
+verification script at `examples/offline_inference_minedraft.py`. For example,
+from that checkout on a two-NPU machine:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 python examples/offline_inference_minedraft.py \
+  --model /models/target --draft-model /models/draft --target-tp 1
+```
+
+The example runs target-only and parallel inference in separate processes,
+checks repeated and uneven batches, and enforces a per-mode timeout. NPU
+correctness and performance still require validation on the target hardware.

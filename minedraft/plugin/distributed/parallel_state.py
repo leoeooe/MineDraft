@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Dict,
@@ -43,6 +43,9 @@ T = TypeVar("T")
 class Works(Generic[T]):
     result: T
     async_handles: List[torch.distributed.Work]
+    # Keep contiguous send buffers alive until the caller has finished waiting.
+    # The result dictionary can still contain the original noncontiguous views.
+    buffers: List[torch.Tensor] = field(default_factory=list, repr=False)
 
     def is_completed(self) -> bool:
         return all(
@@ -58,6 +61,9 @@ class Works(Generic[T]):
 
 
 class GroupCoordinatorPatch(MinePatch[GroupCoordinator]):
+    _orig_send = GroupCoordinator.send
+    _orig_destroy = GroupCoordinator.destroy
+
     is_non_driver_group_for_driver: bool  # whether this is a non-driver group
                                           # for a driver rank
 
@@ -142,6 +148,21 @@ class GroupCoordinatorPatch(MinePatch[GroupCoordinator]):
         self.use_custom_op_call = (current_platform.is_cuda_alike()
                                    or current_platform.is_tpu())
 
+    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
+        # HCCL requires contiguous input, including sliced sampler outputs.
+        if tensor.device.type == "npu":
+            tensor = tensor.contiguous()
+        self._orig_send(tensor, dst)
+
+    def destroy(self) -> None:
+        if self.is_non_driver_group_for_driver:
+            # The driver is not a member of the target group. new_group returns
+            # NON_GROUP_MEMBER here, which must not be destroyed as a real PG.
+            self.device_group = None
+            self.cpu_group = None
+            return
+        self._orig_destroy()
+
     @overload
     def broadcast_tensor_dict(
         self,
@@ -178,11 +199,13 @@ class GroupCoordinatorPatch(MinePatch[GroupCoordinator]):
         """
         # Bypass the function if we are using only 1 GPU.
         if (not torch.distributed.is_initialized() or self.world_size == 1):
-            return tensor_dict
+            return Works(tensor_dict, []) if async_op else tensor_dict
 
         group = self.device_group
         metadata_group = self.cpu_group
-        assert src < self.world_size, f"Invalid src rank ({src})"
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+
+        buffers = []
 
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
@@ -200,6 +223,8 @@ class GroupCoordinatorPatch(MinePatch[GroupCoordinator]):
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     continue
+                tensor = tensor.contiguous()
+                buffers.append(tensor)
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
                     handle = torch.distributed.broadcast(tensor,
@@ -220,9 +245,13 @@ class GroupCoordinatorPatch(MinePatch[GroupCoordinator]):
             async_handles = []
             for key, value in metadata_list:
                 if isinstance(value, TensorMetadata):
+                    # Allocate on this rank's device, not the sender's index.
+                    device = (torch.device("cpu")
+                              if torch.device(value.device).type == "cpu"
+                              else self.device)
                     tensor = torch.empty(value.size,
                                          dtype=value.dtype,
-                                         device=value.device)
+                                         device=device)
                     if tensor.numel() == 0:
                         # Skip broadcasting empty tensors.
                         tensor_dict[key] = tensor
@@ -249,7 +278,7 @@ class GroupCoordinatorPatch(MinePatch[GroupCoordinator]):
             for async_handle in async_handles:
                 async_handle.wait()
             return tensor_dict
-        return Works(tensor_dict, async_handles)
+        return Works(tensor_dict, async_handles, buffers)
 
 
 def get_non_driver_tp_group() -> GroupCoordinator:
@@ -260,6 +289,7 @@ def get_non_driver_tp_group() -> GroupCoordinator:
 
 class ParallelStateModulePatch(MinePatch[parallel_state]):
     _NON_DRIVER_TP: Optional[GroupCoordinator] = None
+    _MINEDRAFT_DRAFT_TP: Optional[GroupCoordinator] = None
 
     @staticmethod
     def init_model_parallel_group(
@@ -333,6 +363,9 @@ class ParallelStateModulePatch(MinePatch[parallel_state]):
 
         # [Parallel SD] Build the non-driver tensor model-parallel groups.
         if initialize_non_driver_tp_group:
+            if tensor_model_parallel_size < 2:
+                raise ValueError("Parallel speculative decoding needs a draft "
+                                 "rank and at least one target rank")
             assert parallel_state._NON_DRIVER_TP is None, (
                 "non-driver tensor model parallel group is already initialized")
 
@@ -411,10 +444,13 @@ class ParallelStateModulePatch(MinePatch[parallel_state]):
                 initialize_non_driver_tp_group)
             return
 
+        # The ordinary TP group includes the draft rank. The public model TP
+        # size intentionally excludes it during parallel speculative decoding.
+        tp_world_size = get_tp_group().world_size
         assert (
-            get_tensor_model_parallel_world_size() == tensor_model_parallel_size
+            tp_world_size == tensor_model_parallel_size
         ), ("tensor parallel group already initialized, but of unexpected size: "
-            f"{get_tensor_model_parallel_world_size()=} vs. "
+            f"{tp_world_size=} vs. "
             f"{tensor_model_parallel_size=}")
         pp_world_size = get_pp_group().world_size
         assert (pp_world_size == pipeline_model_parallel_size), (
@@ -482,6 +518,10 @@ class ParallelStateModulePatch(MinePatch[parallel_state]):
 
     @staticmethod
     def destroy_model_parallel():
+        if parallel_state._MINEDRAFT_DRAFT_TP:
+            parallel_state._MINEDRAFT_DRAFT_TP.destroy()
+        parallel_state._MINEDRAFT_DRAFT_TP = None
+
         if parallel_state._TP:
             parallel_state._TP.destroy()
         parallel_state._TP = None

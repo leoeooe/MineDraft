@@ -1,4 +1,3 @@
-from vllm.sequence import VLLM_INVALID_TOKEN_ID
 from vllm.spec_decode.batch_expansion import BatchExpansionTop1Scorer
 from vllm.spec_decode.interfaces import SpeculativeProposals, SpeculativeScores
 from vllm.spec_decode.util import nvtx_range
@@ -22,8 +21,9 @@ class ParallelBatchExpansionTop1Scorer(BatchExpansionTop1Scorer,
 
         # Filter the list to ignore invalid proposals.
         proposal_token_ids_list_without_skips = [
-            proposals for proposals in proposal_token_ids_list
-            if VLLM_INVALID_TOKEN_ID not in proposals
+            tokens for tokens, length in zip(proposal_token_ids_list,
+                                             proposal_lens_list)
+            if length > 0
         ]
 
         (spec_indices, non_spec_indices, target_seq_group_metadata_list,
@@ -73,8 +73,9 @@ class ParallelBatchExpansionTop1Scorer(BatchExpansionTop1Scorer,
 
         # Filter the list to ignore invalid proposals.
         proposal_token_ids_list_without_skips = [
-            proposals for proposals in proposal_token_ids_list
-            if VLLM_INVALID_TOKEN_ID not in proposals
+            tokens for tokens, length in zip(proposal_token_ids_list,
+                                             proposal_lens_list)
+            if length > 0
         ]
 
         (spec_indices, non_spec_indices, target_seq_group_metadata_list,
